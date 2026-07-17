@@ -4,7 +4,7 @@ import SearchBar from './components/SearchBar.jsx'
 import ChatMessage from './components/ChatMessage.jsx'
 import LoadingDots from './components/LoadingDots.jsx'
 import SuggestedQuestions from './components/SuggestedQuestions.jsx'
-import { mockAsk, SUGGESTED_QUESTIONS } from './data/mockApi.js'
+import { SUGGESTED_QUESTIONS } from './data/mockApi.js'
 import './App.css'
 
 const WELCOME_MESSAGE = {
@@ -12,6 +12,8 @@ const WELCOME_MESSAGE = {
   role: 'bot',
   text: "Hi, I'm SAYA HelpBot. Ask me anything about the SAYA platform — or tap a suggestion below to get started.",
 }
+
+const API_BASE = import.meta.env.VITE_API_BASE || ''
 
 export default function App() {
   // --- STATE ---
@@ -21,6 +23,7 @@ export default function App() {
   const [messages, setMessages] = useState([WELCOME_MESSAGE])
   const [isLoading, setIsLoading] = useState(false)
   const [history, setHistory] = useState([])
+  const [faqList, setFaqList] = useState(SUGGESTED_QUESTIONS)
 
   // A ref gives us a direct handle to a real DOM element (the bottom of the chat)
   // so we can scroll to it whenever a new message arrives.
@@ -29,6 +32,25 @@ export default function App() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isLoading])
+
+  useEffect(() => {
+    async function loadSuggestedQuestions() {
+      try {
+        const response = await fetch(`${API_BASE}/suggested-questions`)
+        if (!response.ok) {
+          throw new Error(`API returned ${response.status}`)
+        }
+        const data = await response.json()
+        if (Array.isArray(data.questions) && data.questions.length > 0) {
+          setFaqList(data.questions)
+        }
+      } catch (error) {
+        console.warn('Could not load suggested questions:', error)
+      }
+    }
+
+    loadSuggestedQuestions()
+  }, [])
 
   // This is the core function: it runs every time the user asks a question,
   // whether they typed it, clicked a suggestion, FAQ item, or "related question" chip.
@@ -40,25 +62,47 @@ export default function App() {
     setHistory((prev) => [question, ...prev].slice(0, 20))
     setIsLoading(true)
 
-    // 2. Ask the "backend" (mock for now — a real fetch() call replaces this later)
-    const result = await mockAsk(question)
+    try {
+      const response = await fetch(`${API_BASE}/ask`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ question }),
+      })
 
-    // 3. Turn the backend's response into a bot message and add it to the list
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: crypto.randomUUID(),
-        role: 'bot',
-        text: result.found
-          ? result.answer
-          : "I couldn't find a confident answer to that yet. Here are some questions I do know:",
-        confidence: result.found ? result.confidence : undefined,
-        ticketId: result.found ? result.id : undefined,
-        related: result.related,
-        notFound: !result.found,
-      },
-    ])
-    setIsLoading(false)
+      if (!response.ok) {
+        throw new Error(`API returned ${response.status}`)
+      }
+
+      const result = await response.json()
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'bot',
+          text: result.answer || 'Sorry, I could not find an answer.',
+          confidence: result.confidence,
+          ticketId: result.source,
+          related: result.related_questions,
+          notFound: result.source === 'NONE',
+        },
+      ])
+    } catch (error) {
+      console.error('Ask failed:', error)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'bot',
+          text: 'Sorry, I could not reach the help server. Please try again later.',
+          notFound: true,
+        },
+      ])
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   function handleClearChat() {
@@ -69,7 +113,7 @@ export default function App() {
   return (
     <div className="app">
       <Sidebar
-        faqList={SUGGESTED_QUESTIONS}
+        faqList={faqList}
         history={history}
         onSelectQuestion={handleAsk}
         onClearChat={handleClearChat}
@@ -109,7 +153,7 @@ export default function App() {
         {messages.length <= 1 && (
           <SuggestedQuestions
             title="Suggested questions"
-            questions={SUGGESTED_QUESTIONS}
+            questions={faqList}
             onSelect={handleAsk}
           />
         )}

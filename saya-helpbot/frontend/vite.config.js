@@ -8,5 +8,11 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173, // the local address our app will run on: http://localhost:5173
+    proxy: {
+      '/ask': 'http://localhost:8000',
+      '/suggested-questions': 'http://localhost:8000',
+      '/reload': 'http://localhost:8000',
+      '/health': 'http://localhost:8000',
+    },
   },
 })
