@@ -23,13 +23,14 @@ import logging
 from typing import Dict, List, Optional, TypedDict
 
 from rapidfuzz import fuzz, process
+import re
 
 logger = logging.getLogger("saya_helpbot.search")
 
 # --- Tuning knobs -----------------------------------------------------------
 # A FAQ match at or above this score is considered confident enough to answer
 # directly. 0-100 scale, where 100 means the question matched a FAQ exactly.
-FAQ_CONFIDENCE_THRESHOLD = 65.0
+FAQ_CONFIDENCE_THRESHOLD = 88.0
 
 # A PDF chunk match below this score is considered too weak to be useful —
 # below this, we'd rather say "I don't know" than show a barely-related paragraph.
@@ -57,14 +58,21 @@ def search(
     question = question.strip()
 
     faq_match = _search_faq(question, faq_list)
-    if faq_match and faq_match["confidence"] >= FAQ_CONFIDENCE_THRESHOLD:
+    pdf_match = _search_pdf(question, pdf_chunks)
+
+    # Debug logging for both scores on every request
+    faq_score = faq_match["confidence"] if faq_match else 0.0
+    pdf_score = pdf_match["confidence"] if pdf_match else 0.0
+    logger.debug("Scores for question=%r: FAQ=%.1f PDF=%.1f", question, faq_score, pdf_score)
+
+    if faq_match and faq_score >= FAQ_CONFIDENCE_THRESHOLD:
         logger.info(
-            "FAQ match found (confidence=%.1f): %r", faq_match["confidence"], question
+            "FAQ match found (confidence=%.1f): %r", faq_score, question
         )
         return {
             "answer": faq_match["answer"],
             "source": "FAQ",
-            "confidence": round(faq_match["confidence"], 1),
+            "confidence": round(faq_score, 1),
             "related_questions": _related_faq_questions(
                 faq_list, exclude_question=faq_match["matched_question"]
             ),
@@ -72,11 +80,10 @@ def search(
             "source_page": None,
         }
 
-    pdf_match = _search_pdf(question, pdf_chunks)
-    if pdf_match and pdf_match["confidence"] >= PDF_CONFIDENCE_FLOOR:
+    if pdf_match and pdf_score >= PDF_CONFIDENCE_FLOOR:
         logger.info(
             "PDF match found (confidence=%.1f) in %s p.%s: %r",
-            pdf_match["confidence"],
+            pdf_score,
             pdf_match["source"],
             pdf_match["page"],
             question,
@@ -84,7 +91,7 @@ def search(
         return {
             "answer": pdf_match["text"],
             "source": "PDF",
-            "confidence": round(pdf_match["confidence"], 1),
+            "confidence": round(pdf_score, 1),
             "related_questions": _related_faq_questions(faq_list, exclude_question=None),
             "source_document": pdf_match["source"],
             "source_page": pdf_match["page"],
@@ -118,10 +125,8 @@ def _search_faq(question: str, faq_list: List[Dict[str, str]]) -> Optional[Dict]
 
     # process.extractOne compares `question` against every string in `choices`
     # and returns the best one: (matched_string, score, index_in_choices).
-    # WRatio is rapidfuzz's "weighted ratio" — it blends several comparison
-    # strategies (exact, partial, token order) and tends to work well for
-    # short, real-world questions typed slightly differently each time.
-    result = process.extractOne(question, choices, scorer=fuzz.WRatio)
+    # Use token_sort_ratio which is stricter about ordering/word differences.
+    result = process.extractOne(question, choices, scorer=fuzz.token_sort_ratio)
     if result is None:
         return None
 
@@ -145,18 +150,33 @@ def _related_faq_questions(
 
 def _search_pdf(question: str, pdf_chunks: List[Dict]) -> Optional[Dict]:
     """Finds the single best-matching PDF chunk using rapidfuzz."""
+    # Deterministic keyword-based matching (no AI, embeddings, or ML).
     if not pdf_chunks or not question:
+        return None
+
+    # Normalize and extract words from the question.
+    query_words = re.findall(r"\w+", question.lower())
+    if not query_words:
         return None
 
     best_chunk: Optional[Dict] = None
     best_score = -1.0
 
     for chunk in pdf_chunks:
-        # token_set_ratio ignores word order and duplicate words, which suits
-        # comparing a short question against a longer paragraph of prose —
-        # e.g. "reset password steps" scores well against a paragraph that
-        # contains those words in a different order, wrapped in other text.
-        score = fuzz.token_set_ratio(question, chunk["text"])
+        text = chunk.get("text", "").lower()
+        # Exact phrase match is highest-confidence
+        if question.lower().strip() in text:
+            score = 100.0
+        else:
+            # Count how many unique query words appear in the chunk
+            matched = 0
+            text_words = set(re.findall(r"\w+", text))
+            for w in set(query_words):
+                if w in text_words:
+                    matched += 1
+            # Score is percentage of query words found (0-100)
+            score = (matched / len(set(query_words))) * 100.0 if query_words else 0.0
+
         if score > best_score:
             best_score = score
             best_chunk = chunk

@@ -29,22 +29,24 @@ import logging
 from pathlib import Path
 from typing import Dict, List
 
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
+import fitz  # PyMuPDF
 
 logger = logging.getLogger("saya_helpbot.pdf_loader")
 
 # docs/ is expected to live in the same folder as this file (backend/docs/).
 DOCS_DIR = Path(__file__).parent / "docs"
 
-# Tuning knobs for chunking. Kept as module-level constants so they're easy
-# to find and adjust without hunting through function bodies.
-MIN_CHUNK_CHARS = 120   # paragraphs shorter than this get merged with the next one
-MAX_CHUNK_CHARS = 900   # paragraphs longer than this get split further
+# Chunking parameters (words)
+# Aim for chunks around 400-600 words; pick a target and overlap to stay inside that
+CHUNK_TARGET = 500
+CHUNK_OVERLAP = 100
 
 
 def load_pdfs(docs_dir: Path = DOCS_DIR) -> List[Dict]:
-    """Scans docs_dir for *.pdf files and returns a flat list of text chunks."""
+    """Scans docs_dir for *.pdf files and returns a flat list of text chunks.
+
+    Each chunk is a dict with keys: text, source (filename), page (1-based).
+    """
     docs_dir.mkdir(parents=True, exist_ok=True)  # create docs/ if it doesn't exist yet
 
     pdf_files = sorted(docs_dir.glob("*.pdf"))
@@ -58,91 +60,67 @@ def load_pdfs(docs_dir: Path = DOCS_DIR) -> List[Dict]:
             chunks = _extract_chunks_from_pdf(pdf_path)
             all_chunks.extend(chunks)
             logger.info("Loaded %d chunks from %s.", len(chunks), pdf_path.name)
-        except PdfReadError as exc:
-            logger.error("Skipping %s — could not be read (corrupted or encrypted): %s", pdf_path.name, exc)
-        except Exception as exc:  # noqa: BLE001 - deliberately broad: one bad PDF must not crash startup
-            logger.error("Skipping %s — unexpected error while parsing: %s", pdf_path.name, exc)
+        except Exception as exc:  # keep robust: don't let one bad PDF stop startup
+            logger.exception("Skipping %s — error while parsing: %s", pdf_path.name, exc)
 
     logger.info("Total PDF chunks loaded across %d file(s): %d", len(pdf_files), len(all_chunks))
     return all_chunks
 
 
 def _extract_chunks_from_pdf(pdf_path: Path) -> List[Dict]:
-    """Opens one PDF and returns its text chunks, tagged with filename + page number."""
-    reader = PdfReader(str(pdf_path))
+    """Opens one PDF with PyMuPDF, extracts page text, and returns overlapping word-chunks.
+
+    Each chunk is tagged with the source filename and the page number it came from.
+    """
+    doc = fitz.open(str(pdf_path))
     chunks: List[Dict] = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
-        if not page_text.strip():
-            continue  # scanned image pages with no text layer produce empty strings
+    for page_number in range(len(doc)):
+        page = doc.load_page(page_number)
+        page_text = page.get_text("text") or ""
+        normalized = _normalize_whitespace(page_text)
+        if not normalized:
+            continue
 
-        for paragraph in _split_into_paragraphs(page_text):
-            chunks.append(
-                {
-                    "text": paragraph,
-                    "source": pdf_path.name,
-                    "page": page_number,
-                }
-            )
+        page_chunks = _split_page_into_overlapping_chunks(normalized)
+        for chunk_text in page_chunks:
+            chunks.append({
+                "text": chunk_text,
+                "source": pdf_path.name,
+                "page": page_number + 1,
+            })
 
+    doc.close()
     return chunks
 
 
-def _split_into_paragraphs(page_text: str) -> List[str]:
+def _normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _split_page_into_overlapping_chunks(page_text: str) -> List[str]:
+    """Split a full page string into overlapping chunks of words.
+
+    We split on whitespace to get words, then build sliding windows of
+    size CHUNK_TARGET with CHUNK_OVERLAP words of overlap between windows.
+    If the page is shorter than CHUNK_TARGET, the whole page is one chunk.
     """
-    Splits one page's raw text into clean, reasonably-sized paragraphs.
+    words = page_text.split()
+    n = len(words)
+    if n == 0:
+        return []
+    if n <= CHUNK_TARGET:
+        return [" ".join(words)]
 
-    Real-world PDF text extraction is messy — paragraph breaks don't always
-    line up with blank lines. This does a best-effort job:
-      1. Split on blank lines first (natural paragraph breaks).
-      2. Merge any pieces that are too short to be useful alone.
-      3. Split any piece that's too long into smaller windows.
-    """
-    raw_pieces = [p.strip() for p in page_text.split("\n\n") if p.strip()]
-    if not raw_pieces:
-        # Some PDFs use single newlines instead of blank lines between paragraphs
-        raw_pieces = [p.strip() for p in page_text.split("\n") if p.strip()]
+    chunks: List[str] = []
+    start = 0
+    step = CHUNK_TARGET - CHUNK_OVERLAP
+    while start < n:
+        end = min(start + CHUNK_TARGET, n)
+        chunk_words = words[start:end]
+        chunks.append(" ".join(chunk_words))
+        if end == n:
+            break
+        start += step
 
-    merged: List[str] = []
-    buffer = ""
-    for piece in raw_pieces:
-        buffer = f"{buffer} {piece}".strip() if buffer else piece
-        if len(buffer) >= MIN_CHUNK_CHARS:
-            merged.append(buffer)
-            buffer = ""
-    if buffer:  # leftover text shorter than MIN_CHUNK_CHARS still needs to be kept
-        if merged:
-            merged[-1] = f"{merged[-1]} {buffer}".strip()
-        else:
-            merged.append(buffer)
-
-    final_chunks: List[str] = []
-    for piece in merged:
-        final_chunks.extend(_hard_split(piece, MAX_CHUNK_CHARS))
-
-    return final_chunks
-
-
-def _hard_split(text: str, max_len: int) -> List[str]:
-    """Splits an overly long paragraph into word-boundary-respecting windows."""
-    if len(text) <= max_len:
-        return [text]
-
-    words = text.split()
-    windows: List[str] = []
-    current: List[str] = []
-    current_len = 0
-
-    for word in words:
-        if current_len + len(word) + 1 > max_len and current:
-            windows.append(" ".join(current))
-            current = []
-            current_len = 0
-        current.append(word)
-        current_len += len(word) + 1
-
-    if current:
-        windows.append(" ".join(current))
-
-    return windows
+    return chunks
